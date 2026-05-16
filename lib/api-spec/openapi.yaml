@@ -3,20 +3,36 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Bot Factory API — SaaS платформа для автогенерации Telegram-ботов
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: auth
+    description: Authentication
+  - name: users
+    description: User profile and balance
+  - name: bots
+    description: Bot management
+  - name: chat
+    description: AI chat conversation
+  - name: transactions
+    description: Credit transactions
+  - name: marketplace
+    description: Bot templates marketplace
+  - name: referral
+    description: Referral program
+  - name: admin
+    description: Admin panel
+
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,13 +40,756 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  # ── AUTH ──────────────────────────────────────────────────────────────────
+  /auth/telegram:
+    post:
+      operationId: authTelegram
+      tags: [auth]
+      summary: Authenticate via Telegram initData
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TelegramAuthInput"
+      responses:
+        "200":
+          description: Authenticated user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResult"
+        "401":
+          description: Invalid initData
+
+  # ── USERS ────────────────────────────────────────────────────────────────
+  /users/me:
+    get:
+      operationId: getMe
+      tags: [users]
+      summary: Get current user profile
+      responses:
+        "200":
+          description: User profile with balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          description: Unauthorized
+
+  /users/stats:
+    get:
+      operationId: getUserStats
+      tags: [users]
+      summary: Get user stats (bots count, total generations, credits spent)
+      responses:
+        "200":
+          description: User stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserStats"
+
+  # ── BOTS ──────────────────────────────────────────────────────────────────
+  /bots:
+    get:
+      operationId: listBots
+      tags: [bots]
+      summary: List all user's bots
+      responses:
+        "200":
+          description: List of bots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Bot"
+    post:
+      operationId: createBot
+      tags: [bots]
+      summary: Create a new bot (starts generation pipeline)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotInput"
+      responses:
+        "201":
+          description: Bot created and generation started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+        "402":
+          description: Insufficient credits
+
+  /bots/{id}:
+    get:
+      operationId: getBot
+      tags: [bots]
+      summary: Get bot details
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Bot details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+        "404":
+          description: Not found
+    patch:
+      operationId: updateBot
+      tags: [bots]
+      summary: Update/improve bot (adds features to existing code)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotUpdate"
+      responses:
+        "200":
+          description: Updated bot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+    delete:
+      operationId: deleteBot
+      tags: [bots]
+      summary: Delete bot and free server resources
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+
+  /bots/{id}/restart:
+    post:
+      operationId: restartBot
+      tags: [bots]
+      summary: Restart bot process
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Bot restarted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+
+  /bots/{id}/stop:
+    post:
+      operationId: stopBot
+      tags: [bots]
+      summary: Stop bot process
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Bot stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+
+  /bots/{id}/start:
+    post:
+      operationId: startBot
+      tags: [bots]
+      summary: Start a stopped bot
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Bot started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+
+  /bots/{id}/logs:
+    get:
+      operationId: getBotLogs
+      tags: [bots]
+      summary: Get last 20 lines of bot logs
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Bot logs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotLogs"
+
+  # ── CHAT ──────────────────────────────────────────────────────────────────
+  /chat/message:
+    post:
+      operationId: sendChatMessage
+      tags: [chat]
+      summary: Send message to AI and get response
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatMessageInput"
+      responses:
+        "200":
+          description: AI response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatMessage"
+
+  /chat/history:
+    get:
+      operationId: getChatHistory
+      tags: [chat]
+      summary: Get chat conversation history
+      responses:
+        "200":
+          description: Chat messages list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ChatMessage"
+
+  /chat/reset:
+    post:
+      operationId: resetChat
+      tags: [chat]
+      summary: Start a new chat session
+      responses:
+        "200":
+          description: Chat reset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResult"
+
+  # ── GENERATION STATUS ─────────────────────────────────────────────────────
+  /generations/{id}:
+    get:
+      operationId: getGeneration
+      tags: [bots]
+      summary: Get generation job status and progress steps
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Generation status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Generation"
+
+  # ── TRANSACTIONS / CREDITS ────────────────────────────────────────────────
+  /transactions:
+    get:
+      operationId: listTransactions
+      tags: [transactions]
+      summary: Get credit transaction history
+      responses:
+        "200":
+          description: Transactions list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Transaction"
+
+  /credits/purchase:
+    post:
+      operationId: purchaseCredits
+      tags: [transactions]
+      summary: Purchase a credit package
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreditPurchaseInput"
+      responses:
+        "200":
+          description: Purchase initiated, credits added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreditPurchaseResult"
+
+  # ── MARKETPLACE ────────────────────────────────────────────────────────────
+  /marketplace:
+    get:
+      operationId: listMarketplace
+      tags: [marketplace]
+      summary: List bot templates in marketplace
+      responses:
+        "200":
+          description: Marketplace templates
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MarketplaceTemplate"
+
+  /marketplace/{id}/deploy:
+    post:
+      operationId: deployTemplate
+      tags: [marketplace]
+      summary: Deploy a marketplace template as a new bot
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateDeployInput"
+      responses:
+        "201":
+          description: Bot created from template
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bot"
+
+  # ── REFERRAL ──────────────────────────────────────────────────────────────
+  /referral:
+    get:
+      operationId: getReferral
+      tags: [referral]
+      summary: Get referral link and statistics
+      responses:
+        "200":
+          description: Referral info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReferralInfo"
+
+  # ── ADMIN ─────────────────────────────────────────────────────────────────
+  /admin/stats:
+    get:
+      operationId: getAdminStats
+      tags: [admin]
+      summary: Platform-wide statistics
+      responses:
+        "200":
+          description: Admin statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminStats"
+
+  /admin/users:
+    get:
+      operationId: listAdminUsers
+      tags: [admin]
+      summary: List all users with balance and plan
+      responses:
+        "200":
+          description: Users list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/User"
+
+  /admin/credits:
+    post:
+      operationId: adminAddCredits
+      tags: [admin]
+      summary: Manually add credits to a user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminCreditsInput"
+      responses:
+        "200":
+          description: Credits added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResult"
+
 components:
   schemas:
     HealthStatus:
       type: object
+      required: [status]
       properties:
         status:
           type: string
-      required:
-        - status
 
+    SuccessResult:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+        message:
+          type: ["string", "null"]
+
+    # ── AUTH ────────────────────────────────────────────────────────────────
+    TelegramAuthInput:
+      type: object
+      required: [initData]
+      properties:
+        initData:
+          type: string
+          description: Raw Telegram WebApp initData string
+        referralCode:
+          type: ["string", "null"]
+
+    AuthResult:
+      type: object
+      required: [user, token]
+      properties:
+        user:
+          $ref: "#/components/schemas/User"
+        token:
+          type: string
+
+    # ── USER ─────────────────────────────────────────────────────────────────
+    User:
+      type: object
+      required: [id, telegramId, credits, plan, createdAt]
+      properties:
+        id:
+          type: string
+        telegramId:
+          type: string
+        username:
+          type: ["string", "null"]
+        firstName:
+          type: ["string", "null"]
+        lastName:
+          type: ["string", "null"]
+        credits:
+          type: integer
+        plan:
+          type: string
+          enum: [free, basic, pro, business]
+        planExpiresAt:
+          type: ["string", "null"]
+        referralCode:
+          type: string
+        isBanned:
+          type: boolean
+        createdAt:
+          type: string
+
+    UserStats:
+      type: object
+      required: [botsCount, botsRunning, totalGenerations, creditsSpent]
+      properties:
+        botsCount:
+          type: integer
+        botsRunning:
+          type: integer
+        totalGenerations:
+          type: integer
+        creditsSpent:
+          type: integer
+
+    # ── BOT ──────────────────────────────────────────────────────────────────
+    Bot:
+      type: object
+      required: [id, userId, name, status, botType, createdAt]
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+        name:
+          type: string
+        description:
+          type: ["string", "null"]
+        botToken:
+          type: ["string", "null"]
+          description: Masked token (last 4 chars)
+        botUsername:
+          type: ["string", "null"]
+        status:
+          type: string
+          enum: [generating, running, stopped, error]
+        botType:
+          type: string
+          enum: [simple, complex, miniapp]
+        generationId:
+          type: ["string", "null"]
+        lastActiveAt:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    BotInput:
+      type: object
+      required: [name, description]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 10
+          description: User's idea description for the bot
+        botToken:
+          type: ["string", "null"]
+          description: Telegram bot token from @BotFather
+
+    BotUpdate:
+      type: object
+      properties:
+        improvement:
+          type: string
+          description: What to add or change in the bot
+
+    BotLogs:
+      type: object
+      required: [botId, lines]
+      properties:
+        botId:
+          type: string
+        lines:
+          type: array
+          items:
+            type: string
+
+    # ── GENERATION ───────────────────────────────────────────────────────────
+    GenerationStep:
+      type: object
+      required: [key, label, status]
+      properties:
+        key:
+          type: string
+        label:
+          type: string
+        status:
+          type: string
+          enum: [pending, in_progress, done, error, skipped]
+
+    Generation:
+      type: object
+      required: [id, botId, status, steps, creditsUsed, createdAt]
+      properties:
+        id:
+          type: string
+        botId:
+          type: string
+        status:
+          type: string
+          enum: [pending, in_progress, done, failed]
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenerationStep"
+        creditsUsed:
+          type: integer
+        elapsedSeconds:
+          type: ["integer", "null"]
+        errorMessage:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    # ── CHAT ─────────────────────────────────────────────────────────────────
+    ChatMessage:
+      type: object
+      required: [id, role, content, createdAt]
+      properties:
+        id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+        generationId:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    ChatMessageInput:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+        sessionId:
+          type: ["string", "null"]
+
+    # ── TRANSACTIONS ─────────────────────────────────────────────────────────
+    Transaction:
+      type: object
+      required: [id, userId, amount, type, createdAt]
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+        amount:
+          type: integer
+          description: Positive = income, Negative = expense
+        type:
+          type: string
+          enum: [purchase, generation, hosting, refund, referral, bonus]
+        description:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    CreditPurchaseInput:
+      type: object
+      required: [packageId]
+      properties:
+        packageId:
+          type: string
+          enum: [starter, basic, pro, max]
+
+    CreditPurchaseResult:
+      type: object
+      required: [success, creditsAdded, newBalance]
+      properties:
+        success:
+          type: boolean
+        creditsAdded:
+          type: integer
+        newBalance:
+          type: integer
+        transactionId:
+          type: string
+
+    # ── MARKETPLACE ───────────────────────────────────────────────────────────
+    MarketplaceTemplate:
+      type: object
+      required: [id, name, description, botType, price, deployCount, createdAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        botType:
+          type: string
+          enum: [simple, complex, miniapp]
+        price:
+          type: integer
+          description: Price in credits
+        authorUsername:
+          type: ["string", "null"]
+        deployCount:
+          type: integer
+        rating:
+          type: ["number", "null"]
+        createdAt:
+          type: string
+
+    TemplateDeployInput:
+      type: object
+      required: [botToken]
+      properties:
+        botToken:
+          type: string
+
+    # ── REFERRAL ─────────────────────────────────────────────────────────────
+    ReferralInfo:
+      type: object
+      required: [referralCode, referralLink, referralsCount, totalEarned]
+      properties:
+        referralCode:
+          type: string
+        referralLink:
+          type: string
+        referralsCount:
+          type: integer
+        totalEarned:
+          type: integer
+          description: Total credits earned through referrals
+
+    # ── ADMIN ─────────────────────────────────────────────────────────────────
+    AdminStats:
+      type: object
+      required: [totalUsers, activeUsers, totalBots, runningBots, totalGenerations, totalRevenue]
+      properties:
+        totalUsers:
+          type: integer
+        activeUsers:
+          type: integer
+          description: Users active in last 30 days
+        totalBots:
+          type: integer
+        runningBots:
+          type: integer
+        totalGenerations:
+          type: integer
+        totalRevenue:
+          type: integer
+          description: Total credits purchased
+
+    AdminCreditsInput:
+      type: object
+      required: [userId, amount]
+      properties:
+        userId:
+          type: string
+        amount:
+          type: integer
+        reason:
+          type: ["string", "null"]
