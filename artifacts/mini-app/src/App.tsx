@@ -1,6 +1,6 @@
 import { Switch, Route, Router as WouterRouter } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Toaster } from "@/components/ui/toaster";
+import { Toaster } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Loader2 } from "lucide-react";
 import NotFound from "@/pages/not-found";
@@ -12,7 +12,9 @@ import ReferralPage from "@/pages/referral";
 import AdminPage from "@/pages/admin";
 import SettingsPage from "@/pages/settings";
 import SupportPage from "@/pages/support";
+import HistoryPage from "@/pages/history";
 import { useTelegramAuth } from "@/lib/auth";
+import { I18nProvider } from "@/lib/i18n";
 
 const queryClient = new QueryClient();
 
@@ -45,6 +47,7 @@ function Router() {
       <Route path="/marketplace" component={MarketplacePage} />
       <Route path="/balance" component={BalancePage} />
       <Route path="/referral" component={ReferralPage} />
+      <Route path="/history" component={HistoryPage} />
       <Route path="/admin" component={AdminPage} />
       <Route path="/settings" component={SettingsPage} />
       <Route path="/support" component={SupportPage} />
@@ -56,12 +59,14 @@ function Router() {
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
-          <Router />
-        </WouterRouter>
-        <Toaster />
-      </TooltipProvider>
+      <I18nProvider>
+        <TooltipProvider>
+          <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
+            <Router />
+          </WouterRouter>
+          <Toaster position="top-center" richColors />
+        </TooltipProvider>
+      </I18nProvider>
     </QueryClientProvider>
   );
 }

@@ -18,6 +18,7 @@ router.get("/users/me", requireAuth, async (req: AuthedRequest, res): Promise<vo
     telegramId: user.telegramId,
     username: user.username,
     firstName: user.firstName,
+    lastName: user.lastName,
     credits: user.credits,
     plan: user.plan,
     planExpiresAt: user.planExpiresAt,

@@ -8,6 +8,7 @@ import transactionsRouter from "./transactions";
 import marketplaceRouter from "./marketplace";
 import referralRouter from "./referral";
 import adminRouter from "./admin";
+import paymentsRouter from "./payments";
 
 const router: IRouter = Router();
 
@@ -20,5 +21,6 @@ router.use(transactionsRouter);
 router.use(marketplaceRouter);
 router.use(referralRouter);
 router.use(adminRouter);
+router.use(paymentsRouter);
 
 export default router;
