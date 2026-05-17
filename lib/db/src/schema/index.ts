@@ -4,3 +4,4 @@ export * from "./transactions";
 export * from "./chat_messages";
 export * from "./generations";
 export * from "./marketplace";
+export * from "./hosting";

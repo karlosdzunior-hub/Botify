@@ -9,6 +9,7 @@ import marketplaceRouter from "./marketplace";
 import referralRouter from "./referral";
 import adminRouter from "./admin";
 import paymentsRouter from "./payments";
+import hostingRouter from "./hosting";
 
 const router: IRouter = Router();
 
@@ -22,5 +23,6 @@ router.use(marketplaceRouter);
 router.use(referralRouter);
 router.use(adminRouter);
 router.use(paymentsRouter);
+router.use(hostingRouter);
 
 export default router;

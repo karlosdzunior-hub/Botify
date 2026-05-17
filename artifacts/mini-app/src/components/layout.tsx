@@ -2,7 +2,7 @@ import { Link, useLocation } from "wouter";
 import { ReactNode, useState } from "react";
 import {
   Menu, X, MessageSquare, Bot, Store,
-  CreditCard, Users, Settings, LifeBuoy, ShieldAlert, History, Download
+  CreditCard, Users, Settings, LifeBuoy, ShieldAlert, History, Download, Server
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
@@ -26,6 +26,7 @@ export function Layout({ children, title = "Botify" }: { children: ReactNode; ti
     { label: t("marketplace"), href: "/marketplace", icon: Store },
     { label: t("history"), href: "/history", icon: History },
     { label: t("balance"), href: "/balance", icon: CreditCard },
+    { label: "Хостинг", href: "/hosting", icon: Server },
     { label: t("referral"), href: "/referral", icon: Users },
   ];
 

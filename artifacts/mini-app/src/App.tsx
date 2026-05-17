@@ -13,6 +13,7 @@ import AdminPage from "@/pages/admin";
 import SettingsPage from "@/pages/settings";
 import SupportPage from "@/pages/support";
 import HistoryPage from "@/pages/history";
+import HostingPage from "@/pages/hosting";
 import { useTelegramAuth } from "@/lib/auth";
 import { I18nProvider } from "@/lib/i18n";
 
@@ -48,6 +49,7 @@ function Router() {
       <Route path="/balance" component={BalancePage} />
       <Route path="/referral" component={ReferralPage} />
       <Route path="/history" component={HistoryPage} />
+      <Route path="/hosting" component={HostingPage} />
       <Route path="/admin" component={AdminPage} />
       <Route path="/settings" component={SettingsPage} />
       <Route path="/support" component={SupportPage} />

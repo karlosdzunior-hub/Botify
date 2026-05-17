@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { requireAuth, type AuthedRequest } from "../middlewares/requireAuth";
 import { notifyUser } from "./telegram-bot-notify";
+import { activateHostingSubscription } from "./hosting";
 
 const router: IRouter = Router();
 
@@ -138,18 +139,8 @@ router.post("/payments/yumoney/webhook", async (req, res): Promise<void> => {
     }
   }
 
-  if (parts[0] === "hosting" && parts.length >= 3) {
-    const [, userId, planId] = parts;
-    if (userId && planId && planId in HOSTING_PLANS) {
-      const plan = HOSTING_PLANS[planId as keyof typeof HOSTING_PLANS];
-      await db.insert(transactionsTable).values({
-        id: randomUUID(),
-        userId,
-        amount: 0,
-        type: "hosting",
-        description: `ЮМани: хостинг ${plan.name}`,
-      });
-    }
+  if (parts[0] === "hosting") {
+    await activateHostingSubscription(label).catch(() => {});
   }
 
   if (parts[0] === "code" && parts.length >= 3) {
