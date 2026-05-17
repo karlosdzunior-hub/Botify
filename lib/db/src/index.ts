@@ -4,7 +4,9 @@ import path from "path";
 import fs from "fs";
 import * as schema from "./schema";
 
-const dbPath = process.env.DATABASE_PATH ?? path.join(process.cwd(), "data", "bot-factory.db");
+// Default: workspace root /data/bot-factory.db (3 dirs up from lib/db/src)
+const WORKSPACE_ROOT = path.resolve(__dirname, "..", "..", "..");
+const dbPath = process.env.DATABASE_PATH ?? path.join(WORKSPACE_ROOT, "data", "bot-factory.db");
 
 const dir = path.dirname(dbPath);
 if (!fs.existsSync(dir)) {
