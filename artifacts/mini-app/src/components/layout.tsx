@@ -11,7 +11,7 @@ import { useI18n } from "@/lib/i18n";
 import { haptic } from "@/lib/haptic";
 import { motion } from "framer-motion";
 
-export function Layout({ children, title = "Bot Factory" }: { children: ReactNode; title?: string }) {
+export function Layout({ children, title = "Botify" }: { children: ReactNode; title?: string }) {
   const [location] = useLocation();
   const [open, setOpen] = useState(false);
   const { data: user } = useGetMe();
@@ -61,7 +61,7 @@ export function Layout({ children, title = "Bot Factory" }: { children: ReactNod
                   <div className="w-7 h-7 rounded-lg bg-primary/20 flex items-center justify-center">
                     <Bot className="w-4 h-4 text-primary" />
                   </div>
-                  <span className="font-bold text-lg">Bot Factory</span>
+                  <span className="font-bold text-lg">Botify</span>
                 </div>
                 <Button variant="ghost" size="icon" onClick={() => setOpen(false)}>
                   <X className="w-5 h-5" />

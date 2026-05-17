@@ -17,7 +17,7 @@ const translations = {
     support: "Поддержка",
     adminPanel: "Админ панель",
     // Chat
-    welcomeTitle: "Добро пожаловать в Bot Factory",
+    welcomeTitle: "Добро пожаловать в Botify",
     welcomeSubtitle: "Опиши Telegram-бота, которого хочешь создать, и я соберу его за секунды.",
     describeBot: "Опиши своего бота...",
     generationProgress: "Прогресс генерации",
@@ -121,7 +121,7 @@ const translations = {
     support: "Support",
     adminPanel: "Admin Panel",
     // Chat
-    welcomeTitle: "Welcome to Bot Factory",
+    welcomeTitle: "Welcome to Botify",
     welcomeSubtitle: "Describe the Telegram bot you want to create, and I'll build it for you in seconds.",
     describeBot: "Describe your bot...",
     generationProgress: "Generation Progress",

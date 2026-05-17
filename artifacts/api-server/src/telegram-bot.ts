@@ -68,22 +68,17 @@ async function handleStart(msg: TelegramMessage, referralCode?: string) {
     logger.info({ telegramId, username }, "New user registered via /start");
   }
 
-  await sendMessage(msg.from.id, `👋 Привет, <b>${firstName}</b>!\n\n🤖 <b>Bot Factory</b> — создай своего Telegram-бота без программирования.\n\nНа твоём счету <b>${user.credits} кредитов</b>. Этого хватит для создания первого бота!\n\n<i>Нажми кнопку ниже, чтобы открыть интерфейс:</i>`, {
+  await sendMessage(msg.from.id, `👋 Привет, <b>${firstName}</b>!\n\n🤖 <b>Botify</b> — создай своего Telegram-бота без программирования.\n\nНа твоём счету <b>${user.credits} кредитов</b>. Этого хватит для создания первого бота!\n\n<i>Нажми кнопку ниже, чтобы открыть интерфейс:</i>`, {
     reply_markup: {
-      inline_keyboard: [[
-        {
-          text: "🚀 Открыть Bot Factory",
-          web_app: { url: MINI_APP_URL },
-        },
-      ]],
+      inline_keyboard: [[{ text: "🚀 Открыть Botify", web_app: { url: MINI_APP_URL } }]],
     },
   });
 }
 
 async function handleHelp(msg: TelegramMessage) {
-  await sendMessage(msg.from.id, `📖 <b>Как пользоваться Bot Factory:</b>\n\n1. Нажми <b>«Открыть Bot Factory»</b>\n2. Опиши своего бота в чате\n3. ИИ задаст уточняющие вопросы\n4. Подтверди план и нажми «Создать»\n5. Через 30–120 секунд бот готов!\n\n<b>Команды:</b>\n/start — главное меню\n/help — эта справка\n/balance — баланс кредитов\n\n<b>Стоимость:</b>\n• Простой бот — 15 кредитов\n• Сложный бот — 35 кредитов\n• Мини-апп — 70 кредитов`, {
+  await sendMessage(msg.from.id, `📖 <b>Как пользоваться Botify:</b>\n\n1. Нажми <b>«Открыть Botify»</b>\n2. Опиши своего бота в чате\n3. ИИ задаст уточняющие вопросы\n4. Подтверди план и нажми «Создать»\n5. Через 30–120 секунд бот готов!\n\n<b>Команды:</b>\n/start — главное меню\n/help — эта справка\n/balance — баланс кредитов\n\n<b>Стоимость:</b>\n• Простой бот — 15 кредитов\n• Сложный бот — 35 кредитов\n• Мини-апп — 70 кредитов`, {
     reply_markup: {
-      inline_keyboard: [[{ text: "🤖 Открыть Bot Factory", web_app: { url: MINI_APP_URL } }]],
+      inline_keyboard: [[{ text: "🤖 Открыть Botify", web_app: { url: MINI_APP_URL } }]],
     },
   });
 }

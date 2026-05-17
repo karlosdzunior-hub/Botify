@@ -1,9 +1,11 @@
 import { Router, type IRouter } from "express";
+import { createHash } from "crypto";
 import { db } from "@workspace/db";
-import { transactionsTable, usersTable } from "@workspace/db";
+import { transactionsTable, usersTable, botsTable, generationsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { requireAuth, type AuthedRequest } from "../middlewares/requireAuth";
+import { notifyUser } from "./telegram-bot-notify";
 
 const router: IRouter = Router();
 
@@ -21,7 +23,43 @@ const HOSTING_PLANS = {
   agency: { price: 1990, bots: 30, name: "Агентский" },
 };
 
-// ── YuMoney ────────────────────────────────────────────────────────────────
+// ── ЮМани Quickpay helpers ─────────────────────────────────────────────────
+
+function buildYooMoneyUrl(params: {
+  wallet: string;
+  amount: number;
+  label: string;
+  description: string;
+  returnUrl: string;
+}): string {
+  const url = new URL("https://yoomoney.ru/quickpay/confirm.xml");
+  url.searchParams.set("receiver", params.wallet);
+  url.searchParams.set("quickpay-form", "shop");
+  url.searchParams.set("targets", params.description);
+  url.searchParams.set("paymentType", "AC");
+  url.searchParams.set("sum", params.amount.toFixed(2));
+  url.searchParams.set("label", params.label);
+  url.searchParams.set("successURL", params.returnUrl);
+  return url.toString();
+}
+
+function verifyYooMoneyNotification(body: Record<string, string>, secret: string): boolean {
+  const fields = [
+    body.notification_type,
+    body.operation_id,
+    body.amount,
+    body.currency,
+    body.datetime,
+    body.sender,
+    body.codepro,
+    secret,
+    body.label,
+  ].join("&");
+  const expected = createHash("sha1").update(fields).digest("hex");
+  return expected === body.sha1_hash;
+}
+
+// ── Кредиты — ЮМани ────────────────────────────────────────────────────────
 
 router.post("/payments/yumoney/create", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const { packageId } = req.body as { packageId?: string };
@@ -32,92 +70,101 @@ router.post("/payments/yumoney/create", requireAuth, async (req: AuthedRequest, 
   }
 
   const pkg = CREDIT_PACKAGES[packageId as keyof typeof CREDIT_PACKAGES];
-  const shopId = process.env.YUMONEY_SHOP_ID;
-  const secretKey = process.env.YUMONEY_SECRET_KEY;
+  const wallet = process.env.YUMONEY_WALLET;
 
-  if (!shopId || !secretKey) {
-    res.status(503).json({ error: "YuMoney not configured" });
+  if (!wallet) {
+    res.status(503).json({ error: "ЮМани не настроен — добавьте YUMONEY_WALLET в .env" });
     return;
   }
 
   const orderId = randomUUID();
+  const label = `credits:${req.userId!}:${packageId}:${orderId}`;
   const returnUrl = process.env.MINI_APP_URL ?? "https://t.me";
 
-  const body = {
-    amount: { value: pkg.price.toFixed(2), currency: "RUB" },
-    confirmation: { type: "redirect", return_url: returnUrl },
-    description: `Bot Factory — ${pkg.name} (${pkg.credits + pkg.bonus} кредитов)`,
-    metadata: { userId: req.userId!, packageId, orderId },
-    capture: true,
-  };
+  const paymentUrl = buildYooMoneyUrl({
+    wallet,
+    amount: pkg.price,
+    label,
+    description: `Botify — ${pkg.name} (${pkg.credits + pkg.bonus} кредитов)`,
+    returnUrl,
+  });
 
-  try {
-    const resp = await fetch("https://api.yookassa.ru/v3/payments", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Basic " + Buffer.from(`${shopId}:${secretKey}`).toString("base64"),
-        "Idempotence-Key": orderId,
-      },
-      body: JSON.stringify(body),
-    });
+  res.json({ paymentUrl, orderId, label });
+});
 
-    const data = (await resp.json()) as { id?: string; confirmation?: { confirmation_url?: string } };
+// Вебхук от ЮМани — приходит когда платёж прошёл
+router.post("/payments/yumoney/webhook", async (req, res): Promise<void> => {
+  const body = req.body as Record<string, string>;
+  const secret = process.env.YUMONEY_NOTIFICATION_SECRET ?? "";
 
-    if (!resp.ok) {
-      res.status(502).json({ error: "YuMoney API error" });
+  if (secret && !verifyYooMoneyNotification(body, secret)) {
+    res.sendStatus(403);
+    return;
+  }
+
+  const label = body.label ?? "";
+  // label format: "credits:userId:packageId:orderId"
+  const parts = label.split(":");
+
+  if (parts[0] === "credits" && parts.length >= 3) {
+    const [, userId, packageId] = parts;
+
+    if (!userId || !packageId || !(packageId in CREDIT_PACKAGES)) {
+      res.sendStatus(400);
       return;
     }
 
-    res.json({
-      paymentId: data.id,
-      confirmationUrl: data.confirmation?.confirmation_url,
-      orderId,
+    const pkg = CREDIT_PACKAGES[packageId as keyof typeof CREDIT_PACKAGES];
+    const totalCredits = pkg.credits + pkg.bonus;
+
+    const [user] = await db.select().from(usersTable).where(eq(usersTable.id, userId));
+    if (!user) {
+      res.sendStatus(404);
+      return;
+    }
+
+    await db.update(usersTable).set({ credits: user.credits + totalCredits }).where(eq(usersTable.id, userId));
+
+    await db.insert(transactionsTable).values({
+      id: randomUUID(),
+      userId,
+      amount: totalCredits,
+      type: "purchase",
+      description: `ЮМани: ${pkg.name} (${pkg.credits}${pkg.bonus > 0 ? `+${pkg.bonus}` : ""} кредитов)`,
     });
-  } catch {
-    res.status(502).json({ error: "Payment service unavailable" });
-  }
-});
 
-router.post("/payments/yumoney/webhook", async (req, res): Promise<void> => {
-  const event = req.body as {
-    event?: string;
-    object?: {
-      id?: string;
-      status?: string;
-      metadata?: { userId?: string; packageId?: string };
-    };
-  };
-
-  if (event.event !== "payment.succeeded" || event.object?.status !== "succeeded") {
-    res.sendStatus(200);
-    return;
+    if (user.telegramId) {
+      notifyUser(user.telegramId, `✅ Оплата прошла! Начислено <b>${totalCredits} кредитов</b>.\n\nТекущий баланс: ${user.credits + totalCredits} кр.`).catch(() => {});
+    }
   }
 
-  const { userId, packageId } = event.object?.metadata ?? {};
-  if (!userId || !packageId || !(packageId in CREDIT_PACKAGES)) {
-    res.sendStatus(400);
-    return;
+  if (parts[0] === "hosting" && parts.length >= 3) {
+    const [, userId, planId] = parts;
+    if (userId && planId && planId in HOSTING_PLANS) {
+      const plan = HOSTING_PLANS[planId as keyof typeof HOSTING_PLANS];
+      await db.insert(transactionsTable).values({
+        id: randomUUID(),
+        userId,
+        amount: 0,
+        type: "hosting",
+        description: `ЮМани: хостинг ${plan.name}`,
+      });
+    }
   }
 
-  const pkg = CREDIT_PACKAGES[packageId as keyof typeof CREDIT_PACKAGES];
-  const totalCredits = pkg.credits + pkg.bonus;
-
-  const [user] = await db.select().from(usersTable).where(eq(usersTable.id, userId));
-  if (!user) {
-    res.sendStatus(404);
-    return;
+  if (parts[0] === "code" && parts.length >= 3) {
+    const [, userId, botId] = parts;
+    if (userId && botId) {
+      const [gen] = await db.select().from(generationsTable).where(eq(generationsTable.botId, botId));
+      if (gen?.generatedCode) {
+        await db.update(botsTable).set({ codePurchased: true } as any).where(eq(botsTable.id, botId));
+        const [user] = await db.select().from(usersTable).where(eq(usersTable.id, userId));
+        if (user?.telegramId) {
+          notifyUser(user.telegramId, `🎉 Оплата получена! Исходный код бота доступен для скачивания.`).catch(() => {});
+        }
+      }
+    }
   }
-
-  await db.update(usersTable).set({ credits: user.credits + totalCredits }).where(eq(usersTable.id, userId));
-
-  await db.insert(transactionsTable).values({
-    id: randomUUID(),
-    userId,
-    amount: totalCredits,
-    type: "purchase",
-    description: `YuMoney: ${pkg.name} (${pkg.credits}${pkg.bonus > 0 ? `+${pkg.bonus}` : ""} кредитов)`,
-  });
 
   res.sendStatus(200);
 });
@@ -140,7 +187,7 @@ router.post("/payments/stars/invoice", requireAuth, async (req: AuthedRequest, r
     return;
   }
 
-  // Stars price: ~1 Star ≈ 0.013$, 1$ ≈ 90₽ — so 199₽ ≈ ~17 Stars
+  // Stars: ~1 Star ≈ 0.013$, 1$ ≈ 90₽ — 199₽ ≈ 17 Stars
   const starsPrice = Math.max(1, Math.round(pkg.price / 12));
 
   try {
@@ -148,7 +195,7 @@ router.post("/payments/stars/invoice", requireAuth, async (req: AuthedRequest, r
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        title: `Bot Factory — ${pkg.name}`,
+        title: `Botify — ${pkg.name}`,
         description: `${pkg.credits + pkg.bonus} кредитов для создания ботов`,
         payload: JSON.stringify({ userId: req.userId!, packageId }),
         currency: "XTR",
@@ -173,10 +220,7 @@ router.post("/payments/stars/webhook", async (req, res): Promise<void> => {
   const update = req.body as {
     pre_checkout_query?: { id?: string };
     message?: {
-      successful_payment?: {
-        invoice_payload?: string;
-        telegram_payment_charge_id?: string;
-      };
+      successful_payment?: { invoice_payload?: string };
       from?: { id?: number };
     };
   };
@@ -218,7 +262,7 @@ router.post("/payments/stars/webhook", async (req, res): Promise<void> => {
   res.sendStatus(200);
 });
 
-// ── Hosting ────────────────────────────────────────────────────────────────
+// ── Хостинг — ЮМани ────────────────────────────────────────────────────────
 
 router.post("/payments/hosting/yumoney", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const { planId } = req.body as { planId?: string };
@@ -229,54 +273,29 @@ router.post("/payments/hosting/yumoney", requireAuth, async (req: AuthedRequest,
   }
 
   const plan = HOSTING_PLANS[planId as keyof typeof HOSTING_PLANS];
-  const shopId = process.env.YUMONEY_SHOP_ID;
-  const secretKey = process.env.YUMONEY_SECRET_KEY;
+  const wallet = process.env.YUMONEY_WALLET;
 
-  if (!shopId || !secretKey) {
-    res.status(503).json({ error: "YuMoney not configured" });
+  if (!wallet) {
+    res.status(503).json({ error: "ЮМани не настроен — добавьте YUMONEY_WALLET в .env" });
     return;
   }
 
   const orderId = randomUUID();
+  const label = `hosting:${req.userId!}:${planId}:${orderId}`;
   const returnUrl = process.env.MINI_APP_URL ?? "https://t.me";
 
-  const body = {
-    amount: { value: plan.price.toFixed(2), currency: "RUB" },
-    confirmation: { type: "redirect", return_url: returnUrl },
-    description: `Bot Factory Хостинг — ${plan.name} (${plan.bots} ${plan.bots === 1 ? "бот" : "ботов"}/мес)`,
-    metadata: { userId: req.userId!, type: "hosting", planId, orderId },
-    capture: true,
-  };
+  const paymentUrl = buildYooMoneyUrl({
+    wallet,
+    amount: plan.price,
+    label,
+    description: `Botify Хостинг — ${plan.name} (${plan.bots} ${plan.bots === 1 ? "бот" : "ботов"}/мес)`,
+    returnUrl,
+  });
 
-  try {
-    const resp = await fetch("https://api.yookassa.ru/v3/payments", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Basic " + Buffer.from(`${shopId}:${secretKey}`).toString("base64"),
-        "Idempotence-Key": orderId,
-      },
-      body: JSON.stringify(body),
-    });
-
-    const data = (await resp.json()) as { id?: string; confirmation?: { confirmation_url?: string } };
-
-    if (!resp.ok) {
-      res.status(502).json({ error: "YuMoney API error" });
-      return;
-    }
-
-    res.json({
-      paymentId: data.id,
-      confirmationUrl: data.confirmation?.confirmation_url,
-      plan: { id: planId, ...plan },
-    });
-  } catch {
-    res.status(502).json({ error: "Payment service unavailable" });
-  }
+  res.json({ paymentUrl, orderId, plan: { id: planId, ...plan } });
 });
 
-// ── Code Purchase ──────────────────────────────────────────────────────────
+// ── Выкуп кода — ЮМани ─────────────────────────────────────────────────────
 
 router.post("/payments/code/purchase", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const { botId } = req.body as { botId?: string };
@@ -286,50 +305,26 @@ router.post("/payments/code/purchase", requireAuth, async (req: AuthedRequest, r
     return;
   }
 
-  const shopId = process.env.YUMONEY_SHOP_ID;
-  const secretKey = process.env.YUMONEY_SECRET_KEY;
+  const wallet = process.env.YUMONEY_WALLET;
 
-  if (!shopId || !secretKey) {
-    res.status(503).json({ error: "YuMoney not configured" });
+  if (!wallet) {
+    res.status(503).json({ error: "ЮМани не настроен — добавьте YUMONEY_WALLET в .env" });
     return;
   }
 
   const orderId = randomUUID();
+  const label = `code:${req.userId!}:${botId}:${orderId}`;
   const returnUrl = process.env.MINI_APP_URL ?? "https://t.me";
 
-  const body = {
-    amount: { value: "2990.00", currency: "RUB" },
-    confirmation: { type: "redirect", return_url: returnUrl },
-    description: "Bot Factory — Выкуп исходного кода бота",
-    metadata: { userId: req.userId!, type: "code_purchase", botId, orderId },
-    capture: true,
-  };
+  const paymentUrl = buildYooMoneyUrl({
+    wallet,
+    amount: 2990,
+    label,
+    description: "Botify — Выкуп исходного кода бота",
+    returnUrl,
+  });
 
-  try {
-    const resp = await fetch("https://api.yookassa.ru/v3/payments", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Basic " + Buffer.from(`${shopId}:${secretKey}`).toString("base64"),
-        "Idempotence-Key": orderId,
-      },
-      body: JSON.stringify(body),
-    });
-
-    const data = (await resp.json()) as { id?: string; confirmation?: { confirmation_url?: string } };
-
-    if (!resp.ok) {
-      res.status(502).json({ error: "YuMoney API error" });
-      return;
-    }
-
-    res.json({
-      paymentId: data.id,
-      confirmationUrl: data.confirmation?.confirmation_url,
-    });
-  } catch {
-    res.status(502).json({ error: "Payment service unavailable" });
-  }
+  res.json({ paymentUrl, orderId });
 });
 
 export default router;

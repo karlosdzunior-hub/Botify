@@ -55,12 +55,12 @@ export default function BalancePage() {
     haptic.medium();
     setLoadingPkg(pkg.id);
     try {
-      const result = await customFetch<{ confirmationUrl?: string }>("/api/payments/yumoney/create", {
+      const result = await customFetch<{ paymentUrl?: string }>("/api/payments/yumoney/create", {
         method: "POST",
         body: JSON.stringify({ packageId: pkg.id }),
       });
-      if (result.confirmationUrl) {
-        window.open(result.confirmationUrl, "_blank");
+      if (result.paymentUrl) {
+        window.open(result.paymentUrl, "_blank");
       } else {
         toast.error("Не удалось создать платёж");
         haptic.error();
@@ -121,18 +121,18 @@ export default function BalancePage() {
     haptic.medium();
     setLoadingHosting(planId);
     try {
-      const result = await customFetch<{ confirmationUrl?: string }>("/api/payments/hosting/yumoney", {
+      const result = await customFetch<{ paymentUrl?: string }>("/api/payments/hosting/yumoney", {
         method: "POST",
         body: JSON.stringify({ planId }),
       });
-      if (result.confirmationUrl) {
-        window.open(result.confirmationUrl, "_blank");
+      if (result.paymentUrl) {
+        window.open(result.paymentUrl, "_blank");
       } else {
         toast.error("Не удалось создать платёж");
         haptic.error();
       }
     } catch {
-      toast.info("Хостинг: настройте YuMoney в .env файле");
+      toast.info("Хостинг: настройте ЮМани в .env файле");
     } finally {
       setLoadingHosting(null);
     }
