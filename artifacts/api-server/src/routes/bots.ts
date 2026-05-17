@@ -5,6 +5,8 @@ import { eq, and, desc } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { requireAuth, type AuthedRequest } from "../middlewares/requireAuth";
 import { encryptToken, decryptToken, isEncrypted } from "../lib/crypto";
+import { generateBotCode, checkAndFixBotCode, classifyBotType } from "../lib/ai";
+import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
 
@@ -139,54 +141,174 @@ router.post("/bots", requireAuth, async (req: AuthedRequest, res): Promise<void>
     description: `Создание бота: ${name} (${botType})`,
   });
 
-  simulateGeneration(generationId, botId, cost, !!encryptedToken).catch(() => {});
+  runGeneration(generationId, botId, name, description, botType, cost, !!encryptedToken).catch((err) => {
+    logger.error({ err, generationId }, "Generation pipeline crashed");
+  });
 
   res.status(201).json(botToResponse(bot));
 });
 
-async function simulateGeneration(generationId: string, botId: string, cost: number, hasToken: boolean) {
-  const steps = [
-    { key: "analyze", label: "Анализирую запрос", delay: 3000 },
-    { key: "plan", label: "Составляю план", delay: 5000 },
-    { key: "token", label: "Проверяю токен", delay: hasToken ? 2000 : 1000 },
-    { key: "generate", label: "Генерирую код", delay: 8000 },
-    { key: "check", label: "Проверяю ошибки", delay: 5000 },
-    { key: "launch", label: "Запускаю бота", delay: 3000 },
+type StepKey = "analyze" | "plan" | "token" | "generate" | "check" | "launch";
+
+async function updateStep(
+  generationId: string,
+  allSteps: { key: StepKey; label: string }[],
+  currentKey: StepKey,
+  status: "in_progress" | "done" | "error",
+  elapsed: number,
+) {
+  const updatedSteps = allSteps.map((s) => {
+    const prevDone = allSteps.indexOf(s) < allSteps.findIndex((x) => x.key === currentKey);
+    if (prevDone) return { key: s.key, label: s.label, status: "done" };
+    if (s.key === currentKey) return { key: s.key, label: s.label, status };
+    return { key: s.key, label: s.label, status: "pending" };
+  });
+  await db
+    .update(generationsTable)
+    .set({ steps: updatedSteps, elapsedSeconds: elapsed })
+    .where(eq(generationsTable.id, generationId));
+}
+
+async function runGeneration(
+  generationId: string,
+  botId: string,
+  botName: string,
+  description: string,
+  botType: "simple" | "complex" | "miniapp",
+  cost: number,
+  hasToken: boolean,
+) {
+  const start = Date.now();
+  const elapsed = () => Math.round((Date.now() - start) / 1000);
+
+  const STEPS: { key: StepKey; label: string }[] = [
+    { key: "analyze", label: "Анализирую запрос" },
+    { key: "plan", label: "Уточняю тип бота" },
+    { key: "token", label: "Проверяю токен" },
+    { key: "generate", label: "Генерирую код" },
+    { key: "check", label: "Проверяю и исправляю ошибки" },
+    { key: "launch", label: "Бот готов" },
   ];
 
-  let elapsed = 0;
+  try {
+    // Step 1 — Analyze
+    await updateStep(generationId, STEPS, "analyze", "in_progress", elapsed());
+    const detectedType = await classifyBotType(description);
+    const finalType = detectedType !== botType ? detectedType : botType;
+    await updateStep(generationId, STEPS, "analyze", "done", elapsed());
 
-  for (let i = 0; i < steps.length; i++) {
-    await new Promise((r) => setTimeout(r, steps[i].delay));
-    elapsed += Math.round(steps[i].delay / 1000);
+    // Step 2 — Plan (classify & confirm)
+    await updateStep(generationId, STEPS, "plan", "in_progress", elapsed());
+    await new Promise((r) => setTimeout(r, 500));
+    await updateStep(generationId, STEPS, "plan", "done", elapsed());
 
-    const updatedSteps = steps.map((s, idx) => ({
-      key: s.key,
-      label: s.label,
-      status: idx < i ? "done" : idx === i ? "in_progress" : "pending",
-    }));
-
-    if (i === steps.length - 1) {
-      updatedSteps[i].status = "done";
+    // Step 3 — Token check
+    await updateStep(generationId, STEPS, "token", "in_progress", elapsed());
+    if (hasToken) {
+      await new Promise((r) => setTimeout(r, 800));
     }
+    await updateStep(generationId, STEPS, "token", "done", elapsed());
+
+    // Step 4 — Generate code
+    await updateStep(generationId, STEPS, "generate", "in_progress", elapsed());
+    let generatedCode = await generateBotCode(botName, description, finalType);
+
+    // Strip markdown code blocks if AI wrapped the code
+    generatedCode = generatedCode
+      .replace(/^```python\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
 
     await db
       .update(generationsTable)
-      .set({ steps: updatedSteps, elapsedSeconds: elapsed })
+      .set({ generatedCode, elapsedSeconds: elapsed() })
       .where(eq(generationsTable.id, generationId));
+    await updateStep(generationId, STEPS, "generate", "done", elapsed());
+
+    // Step 5 — Check & fix errors (up to 3 iterations)
+    await updateStep(generationId, STEPS, "check", "in_progress", elapsed());
+
+    const MAX_FIX_ATTEMPTS = 3;
+    let fixAttempts = 0;
+    let currentCode = generatedCode;
+
+    for (let attempt = 0; attempt < MAX_FIX_ATTEMPTS; attempt++) {
+      const checkResult = await checkAndFixBotCode(currentCode, botName);
+
+      if (!checkResult.hasErrors || checkResult.errors.length === 0) {
+        logger.info({ generationId, attempt }, "Code passed checks");
+        break;
+      }
+
+      fixAttempts++;
+      logger.info({ generationId, attempt, errors: checkResult.errors }, "Fixing errors");
+
+      if (checkResult.fixedCode) {
+        currentCode = checkResult.fixedCode
+          .replace(/^```python\s*/i, "")
+          .replace(/^```\s*/i, "")
+          .replace(/```\s*$/i, "")
+          .trim();
+
+        await db
+          .update(generationsTable)
+          .set({ generatedCode: currentCode, fixAttempts, elapsedSeconds: elapsed() })
+          .where(eq(generationsTable.id, generationId));
+      } else {
+        break;
+      }
+    }
+
+    await updateStep(generationId, STEPS, "check", "done", elapsed());
+
+    // Step 6 — Done
+    await updateStep(generationId, STEPS, "launch", "in_progress", elapsed());
+    await new Promise((r) => setTimeout(r, 500));
+
+    const finalSteps = STEPS.map((s) => ({ key: s.key, label: s.label, status: "done" }));
+    await db
+      .update(generationsTable)
+      .set({
+        status: "done",
+        steps: finalSteps,
+        creditsUsed: cost,
+        elapsedSeconds: elapsed(),
+        generatedCode: currentCode,
+        fixAttempts,
+      })
+      .where(eq(generationsTable.id, generationId));
+
+    await db
+      .update(botsTable)
+      .set({ status: "running", lastActiveAt: new Date() })
+      .where(eq(botsTable.id, botId));
+
+    logger.info({ generationId, botId, elapsed: elapsed(), fixAttempts }, "Generation complete");
+  } catch (err) {
+    logger.error({ err, generationId }, "Generation failed");
+
+    const failedSteps = STEPS.map((s, idx) => ({
+      key: s.key,
+      label: s.label,
+      status: idx < STEPS.length - 1 ? "done" : "error",
+    }));
+
+    await db
+      .update(generationsTable)
+      .set({
+        status: "failed",
+        steps: failedSteps,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        elapsedSeconds: elapsed(),
+      })
+      .where(eq(generationsTable.id, generationId));
+
+    await db
+      .update(botsTable)
+      .set({ status: "error" })
+      .where(eq(botsTable.id, botId));
   }
-
-  const finalSteps = steps.map((s) => ({ key: s.key, label: s.label, status: "done" }));
-
-  await db
-    .update(generationsTable)
-    .set({ status: "done", steps: finalSteps, creditsUsed: cost, elapsedSeconds: elapsed })
-    .where(eq(generationsTable.id, generationId));
-
-  await db
-    .update(botsTable)
-    .set({ status: "running", lastActiveAt: new Date() })
-    .where(eq(botsTable.id, botId));
 }
 
 router.get("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
@@ -273,49 +395,99 @@ router.patch("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<
 
     await db.update(botsTable).set({ generationId: genId }).where(eq(botsTable.id, id));
 
-    simulateImprovement(genId, id, IMPROVE_COST).catch(() => {});
+    runImprovement(genId, id, existing.name, existing.description ?? "", improvement, IMPROVE_COST).catch((err) => {
+      logger.error({ err, genId }, "Improvement pipeline crashed");
+    });
   }
 
   res.json(botToResponse(updated));
 });
 
-async function simulateImprovement(generationId: string, botId: string, cost: number) {
-  const steps = [
-    { key: "analyze", label: "Анализирую изменения", delay: 2000 },
-    { key: "generate", label: "Вношу изменения", delay: 6000 },
-    { key: "check", label: "Проверяю ошибки", delay: 3000 },
-    { key: "launch", label: "Перезапускаю бота", delay: 2000 },
-  ];
+async function runImprovement(
+  generationId: string,
+  botId: string,
+  botName: string,
+  originalDescription: string,
+  improvement: string,
+  cost: number,
+) {
+  const start = Date.now();
+  const elapsed = () => Math.round((Date.now() - start) / 1000);
 
-  let elapsed = 0;
-  for (let i = 0; i < steps.length; i++) {
-    await new Promise((r) => setTimeout(r, steps[i].delay));
-    elapsed += Math.round(steps[i].delay / 1000);
+  const STEPS = [
+    { key: "analyze", label: "Анализирую изменения" },
+    { key: "generate", label: "Вношу изменения в код" },
+    { key: "check", label: "Проверяю и исправляю ошибки" },
+    { key: "launch", label: "Обновление готово" },
+  ] as const;
 
-    const updatedSteps = steps.map((s, idx) => ({
-      key: s.key,
-      label: s.label,
-      status: idx < i ? "done" : idx === i ? "in_progress" : "pending",
-    }));
+  type ImpStepKey = (typeof STEPS)[number]["key"];
 
-    if (i === steps.length - 1) updatedSteps[i].status = "done";
-
+  const updateImpStep = async (key: ImpStepKey, status: "in_progress" | "done" | "error") => {
+    const updatedSteps = STEPS.map((s) => {
+      const prevDone = STEPS.indexOf(s) < STEPS.findIndex((x) => x.key === key);
+      if (prevDone) return { key: s.key, label: s.label, status: "done" };
+      if (s.key === key) return { key: s.key, label: s.label, status };
+      return { key: s.key, label: s.label, status: "pending" };
+    });
     await db
       .update(generationsTable)
-      .set({ steps: updatedSteps, elapsedSeconds: elapsed })
+      .set({ steps: updatedSteps, elapsedSeconds: elapsed() })
       .where(eq(generationsTable.id, generationId));
+  };
+
+  try {
+    await updateImpStep("analyze", "in_progress");
+    await new Promise((r) => setTimeout(r, 500));
+    await updateImpStep("analyze", "done");
+
+    await updateImpStep("generate", "in_progress");
+    const fullDescription = `${originalDescription}\n\nДобавить функцию: ${improvement}`;
+    let newCode = await generateBotCode(botName, fullDescription, "complex");
+    newCode = newCode
+      .replace(/^```python\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
+    await updateImpStep("generate", "done");
+
+    await updateImpStep("check", "in_progress");
+    let fixAttempts = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const checkResult = await checkAndFixBotCode(newCode, botName);
+      if (!checkResult.hasErrors) break;
+      fixAttempts++;
+      if (checkResult.fixedCode) {
+        newCode = checkResult.fixedCode
+          .replace(/^```python\s*/i, "")
+          .replace(/^```\s*/i, "")
+          .replace(/```\s*$/i, "")
+          .trim();
+      } else break;
+    }
+    await updateImpStep("check", "done");
+
+    await updateImpStep("launch", "in_progress");
+    await new Promise((r) => setTimeout(r, 300));
+
+    const finalSteps = STEPS.map((s) => ({ key: s.key, label: s.label, status: "done" }));
+    await db
+      .update(generationsTable)
+      .set({ status: "done", steps: finalSteps, creditsUsed: cost, elapsedSeconds: elapsed(), generatedCode: newCode, fixAttempts })
+      .where(eq(generationsTable.id, generationId));
+
+    await db
+      .update(botsTable)
+      .set({ status: "running", lastActiveAt: new Date(), generationId })
+      .where(eq(botsTable.id, botId));
+  } catch (err) {
+    logger.error({ err, generationId }, "Improvement failed");
+    await db
+      .update(generationsTable)
+      .set({ status: "failed", errorMessage: err instanceof Error ? err.message : String(err), elapsedSeconds: elapsed() })
+      .where(eq(generationsTable.id, generationId));
+    await db.update(botsTable).set({ status: "error" }).where(eq(botsTable.id, botId));
   }
-
-  const finalSteps = steps.map((s) => ({ key: s.key, label: s.label, status: "done" }));
-  await db
-    .update(generationsTable)
-    .set({ status: "done", steps: finalSteps, creditsUsed: cost, elapsedSeconds: elapsed })
-    .where(eq(generationsTable.id, generationId));
-
-  await db
-    .update(botsTable)
-    .set({ status: "running", lastActiveAt: new Date() })
-    .where(eq(botsTable.id, botId));
 }
 
 router.delete("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<void> => {

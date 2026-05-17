@@ -13,6 +13,8 @@ export const generationsTable = pgTable("generations", {
   creditsUsed: integer("credits_used").notNull().default(0),
   elapsedSeconds: integer("elapsed_seconds"),
   errorMessage: text("error_message"),
+  generatedCode: text("generated_code"),
+  fixAttempts: integer("fix_attempts").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
 });
