@@ -1,21 +1,20 @@
-import { pgTable, text, integer, timestamp, real, pgEnum } from "drizzle-orm/pg-core";
+import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const marketplaceBotTypeEnum = pgEnum("marketplace_bot_type", ["simple", "complex", "miniapp"]);
-
-export const marketplaceTable = pgTable("marketplace", {
+export const marketplaceTable = sqliteTable("marketplace", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   description: text("description").notNull(),
-  botType: marketplaceBotTypeEnum("bot_type").notNull().default("simple"),
+  botType: text("bot_type", { enum: ["simple", "complex", "miniapp"] }).notNull().default("simple"),
   price: integer("price").notNull().default(10),
   authorId: text("author_id"),
   authorUsername: text("author_username"),
   deployCount: integer("deploy_count").notNull().default(0),
   rating: real("rating"),
   codeSnapshot: text("code_snapshot"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });
 
 export const insertMarketplaceSchema = createInsertSchema(marketplaceTable).omit({ createdAt: true });

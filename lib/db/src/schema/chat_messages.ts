@@ -1,17 +1,16 @@
-import { pgTable, text, timestamp, pgEnum } from "drizzle-orm/pg-core";
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const chatRoleEnum = pgEnum("chat_role", ["user", "assistant", "system"]);
-
-export const chatMessagesTable = pgTable("chat_messages", {
+export const chatMessagesTable = sqliteTable("chat_messages", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),
   sessionId: text("session_id").notNull(),
-  role: chatRoleEnum("role").notNull(),
+  role: text("role", { enum: ["user", "assistant", "system"] }).notNull(),
   content: text("content").notNull(),
   generationId: text("generation_id"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });
 
 export const insertChatMessageSchema = createInsertSchema(chatMessagesTable).omit({ createdAt: true });

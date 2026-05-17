@@ -1,25 +1,23 @@
-import { pgTable, text, integer, timestamp, pgEnum, boolean } from "drizzle-orm/pg-core";
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const hostingPlanEnum = pgEnum("hosting_plan", ["nano", "start", "pro", "business"]);
-export const hostingStatusEnum = pgEnum("hosting_status", ["active", "expired", "cancelled", "pending"]);
-
-export const hostingSubscriptionsTable = pgTable("hosting_subscriptions", {
+export const hostingSubscriptionsTable = sqliteTable("hosting_subscriptions", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),
   botId: text("bot_id"),
-  plan: hostingPlanEnum("plan").notNull(),
-  status: hostingStatusEnum("status").notNull().default("pending"),
+  plan: text("plan", { enum: ["nano", "start", "pro", "business"] }).notNull(),
+  status: text("status", { enum: ["active", "expired", "cancelled", "pending"] }).notNull().default("pending"),
   ramGb: integer("ram_gb").notNull(),
   storageGb: integer("storage_gb").notNull(),
   maxBots: integer("max_bots").notNull(),
   priceRub: integer("price_rub").notNull(),
-  paidUntil: timestamp("paid_until", { withTimezone: true }),
+  paidUntil: integer("paid_until", { mode: "timestamp" }),
   yumonyLabel: text("yumoney_label"),
-  autoRenew: boolean("auto_renew").notNull().default(false),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
+  autoRenew: integer("auto_renew", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`).$onUpdate(() => new Date()),
 });
 
 export const insertHostingSubscriptionSchema = createInsertSchema(hostingSubscriptionsTable).omit({ createdAt: true, updatedAt: true });

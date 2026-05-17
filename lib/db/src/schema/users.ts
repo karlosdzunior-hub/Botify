@@ -1,23 +1,22 @@
-import { pgTable, text, integer, boolean, timestamp, pgEnum } from "drizzle-orm/pg-core";
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const planEnum = pgEnum("plan", ["free", "basic", "pro", "business"]);
-
-export const usersTable = pgTable("users", {
+export const usersTable = sqliteTable("users", {
   id: text("id").primaryKey(),
   telegramId: text("telegram_id").notNull().unique(),
   username: text("username"),
   firstName: text("first_name"),
   lastName: text("last_name"),
   credits: integer("credits").notNull().default(30),
-  plan: planEnum("plan").notNull().default("free"),
-  planExpiresAt: timestamp("plan_expires_at", { withTimezone: true }),
+  plan: text("plan", { enum: ["free", "basic", "pro", "business"] }).notNull().default("free"),
+  planExpiresAt: integer("plan_expires_at", { mode: "timestamp" }),
   referralCode: text("referral_code").notNull().unique(),
   referredBy: text("referred_by"),
-  isBanned: boolean("is_banned").notNull().default(false),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
+  isBanned: integer("is_banned", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`).$onUpdate(() => new Date()),
 });
 
 export const insertUserSchema = createInsertSchema(usersTable).omit({ createdAt: true, updatedAt: true });
