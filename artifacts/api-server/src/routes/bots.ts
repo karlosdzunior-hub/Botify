@@ -1,12 +1,20 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
-import { botsTable, generationsTable, transactionsTable, usersTable } from "@workspace/db";
+import {
+  botsTable,
+  generationsTable,
+  transactionsTable,
+  usersTable,
+  hostingSubscriptionsTable,
+} from "@workspace/db";
 import { eq, and, desc } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { requireAuth, type AuthedRequest } from "../middlewares/requireAuth";
 import { encryptToken, decryptToken, isEncrypted } from "../lib/crypto";
 import { generateBotCode, checkAndFixBotCode, classifyBotType } from "../lib/ai";
 import { logger } from "../lib/logger";
+import * as botRunner from "../lib/botRunner";
+import { HOSTING_PLANS } from "./hosting";
 
 const router: IRouter = Router();
 
@@ -17,6 +25,10 @@ const CREDIT_COSTS = {
 };
 
 const IMPROVE_COST = 12;
+const TRIAL_DURATION_MS = 30 * 60 * 1000;
+
+// Active trial timers (in-memory; survive only until server restart)
+const trialTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function maskToken(token: string): string {
   if (!token || token.length < 8) return "****";
@@ -36,9 +48,53 @@ function botToResponse(bot: typeof botsTable.$inferSelect) {
     botType: bot.botType,
     generationId: bot.generationId,
     lastActiveAt: bot.lastActiveAt,
+    publishedAt: bot.publishedAt,
+    trialEndsAt: bot.trialEndsAt,
     createdAt: bot.createdAt,
   };
 }
+
+/** Deploy bot process: write files, install deps, spawn Python */
+async function launchBotProcess(
+  bot: typeof botsTable.$inferSelect,
+  gen: typeof generationsTable.$inferSelect,
+): Promise<{ pid: number; dirPath: string }> {
+  if (!gen.generatedCode) throw new Error("Нет сгенерированного кода");
+  if (!bot.botToken) throw new Error("Укажи токен бота (@BotFather)");
+
+  const rawToken = isEncrypted(bot.botToken) ? decryptToken(bot.botToken) : bot.botToken;
+
+  if (bot.dirPath) {
+    const { pid } = await botRunner.redeployBot(bot.id, gen.generatedCode, bot.dirPath);
+    return { pid, dirPath: bot.dirPath };
+  }
+  return botRunner.deployBot(bot.id, gen.generatedCode, rawToken);
+}
+
+/** Called externally (from hosting.ts) after payment to start bot */
+export async function publishBotAfterPayment(botId: string): Promise<void> {
+  const [bot] = await db.select().from(botsTable).where(eq(botsTable.id, botId));
+  if (!bot || !bot.generationId) return;
+
+  const [gen] = await db
+    .select()
+    .from(generationsTable)
+    .where(eq(generationsTable.id, bot.generationId));
+  if (!gen?.generatedCode) return;
+
+  try {
+    const { pid, dirPath } = await launchBotProcess(bot, gen);
+    await db
+      .update(botsTable)
+      .set({ status: "running", publishedAt: new Date(), pid, dirPath, lastActiveAt: new Date() })
+      .where(eq(botsTable.id, botId));
+  } catch (err) {
+    logger.error({ err, botId }, "Failed to publish bot after payment");
+    await db.update(botsTable).set({ status: "error" }).where(eq(botsTable.id, botId));
+  }
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 router.get("/bots", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const bots = await db
@@ -81,11 +137,9 @@ router.post("/bots", requireAuth, async (req: AuthedRequest, res): Promise<void>
     return;
   }
 
-  // Validate and encrypt bot token if provided
   let encryptedToken: string | null = null;
   if (botToken && botToken.trim()) {
     const trimmed = botToken.trim();
-    // Basic Telegram bot token format validation: numbers:alphanumeric
     if (!/^\d+:[A-Za-z0-9_-]{35,}$/.test(trimmed)) {
       res.status(400).json({ error: "Invalid bot token format. Get it from @BotFather" });
       return;
@@ -141,12 +195,193 @@ router.post("/bots", requireAuth, async (req: AuthedRequest, res): Promise<void>
     description: `Создание бота: ${name} (${botType})`,
   });
 
-  runGeneration(generationId, botId, name, description, botType, cost, !!encryptedToken).catch((err) => {
-    logger.error({ err, generationId }, "Generation pipeline crashed");
-  });
+  runGeneration(generationId, botId, name, description, botType, cost, !!encryptedToken).catch(
+    (err) => {
+      logger.error({ err, generationId }, "Generation pipeline crashed");
+    },
+  );
 
   res.status(201).json(botToResponse(bot));
 });
+
+// ─── Publish endpoint ──────────────────────────────────────────────────────────
+
+router.post("/bots/:id/publish", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const { plan } = req.body as { plan?: string };
+
+  if (!plan) {
+    res.status(400).json({ error: "plan обязателен" });
+    return;
+  }
+
+  const [bot] = await db
+    .select()
+    .from(botsTable)
+    .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
+
+  if (!bot) {
+    res.status(404).json({ error: "Bot not found" });
+    return;
+  }
+
+  if (!bot.botToken) {
+    res
+      .status(400)
+      .json({ error: "Укажи токен бота. Получи его у @BotFather и добавь при создании." });
+    return;
+  }
+
+  if (!bot.generationId) {
+    res.status(400).json({ error: "Бот ещё не готов" });
+    return;
+  }
+
+  const [gen] = await db
+    .select()
+    .from(generationsTable)
+    .where(eq(generationsTable.id, bot.generationId));
+
+  if (!gen?.generatedCode) {
+    res.status(400).json({ error: "Код бота не сгенерирован" });
+    return;
+  }
+
+  // ── Trial ──────────────────────────────────────────────────────────────────
+  if (plan === "trial") {
+    if (bot.trialEndsAt) {
+      res.status(400).json({ error: "Пробный период уже использован для этого бота" });
+      return;
+    }
+
+    try {
+      const { pid, dirPath } = await launchBotProcess(bot, gen);
+      const trialEndsAt = new Date(Date.now() + TRIAL_DURATION_MS);
+
+      await db
+        .update(botsTable)
+        .set({
+          status: "running",
+          publishedAt: new Date(),
+          trialEndsAt,
+          pid,
+          dirPath,
+          lastActiveAt: new Date(),
+        })
+        .where(eq(botsTable.id, id));
+
+      // Auto-stop after 30 min
+      const timer = setTimeout(async () => {
+        trialTimers.delete(id);
+        botRunner.stopBot(id);
+        await db.update(botsTable).set({ status: "stopped" }).where(eq(botsTable.id, id));
+        logger.info({ botId: id }, "Trial expired, bot stopped");
+      }, TRIAL_DURATION_MS);
+
+      if (typeof timer === "object" && "unref" in timer) (timer as any).unref();
+      trialTimers.set(id, timer);
+
+      const [updated] = await db.select().from(botsTable).where(eq(botsTable.id, id));
+      res.json({ success: true, trialEndsAt, bot: botToResponse(updated) });
+    } catch (err) {
+      logger.error({ err, botId: id }, "Failed to start trial bot");
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: `Не удалось запустить бота: ${msg}` });
+    }
+    return;
+  }
+
+  // ── Paid plan ──────────────────────────────────────────────────────────────
+  if (!(plan in HOSTING_PLANS)) {
+    res.status(400).json({ error: "Неверный тариф" });
+    return;
+  }
+
+  // Check if user already has active hosting
+  const [activeSub] = await db
+    .select()
+    .from(hostingSubscriptionsTable)
+    .where(
+      and(
+        eq(hostingSubscriptionsTable.userId, req.userId!),
+        eq(hostingSubscriptionsTable.status, "active"),
+      ),
+    );
+
+  if (activeSub) {
+    // Already has hosting — launch immediately
+    try {
+      const { pid, dirPath } = await launchBotProcess(bot, gen);
+      await db
+        .update(botsTable)
+        .set({
+          status: "running",
+          publishedAt: new Date(),
+          pid,
+          dirPath,
+          lastActiveAt: new Date(),
+          hostingSubId: activeSub.id,
+        })
+        .where(eq(botsTable.id, id));
+
+      const [updated] = await db.select().from(botsTable).where(eq(botsTable.id, id));
+      res.json({ success: true, bot: botToResponse(updated) });
+    } catch (err) {
+      logger.error({ err, botId: id }, "Failed to publish bot");
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: `Не удалось запустить бота: ${msg}` });
+    }
+    return;
+  }
+
+  // No active hosting — create payment
+  const hostingPlan = HOSTING_PLANS[plan as keyof typeof HOSTING_PLANS];
+  const wallet = process.env.YUMONEY_WALLET;
+
+  if (!wallet) {
+    res.status(503).json({ error: "ЮМани не настроен на сервере" });
+    return;
+  }
+
+  const orderId = randomUUID();
+  const label = `hosting:${req.userId!}:${plan}:${orderId}`;
+  const returnUrl = process.env.MINI_APP_URL ?? "https://t.me";
+
+  const url = new URL("https://yoomoney.ru/quickpay/confirm.xml");
+  url.searchParams.set("receiver", wallet);
+  url.searchParams.set("quickpay-form", "shop");
+  url.searchParams.set(
+    "targets",
+    `Bot Factory Хостинг ${hostingPlan.name} — ${hostingPlan.ramGb}GB RAM`,
+  );
+  url.searchParams.set("paymentType", "AC");
+  url.searchParams.set("sum", hostingPlan.priceRub.toFixed(2));
+  url.searchParams.set("label", label);
+  url.searchParams.set("successURL", returnUrl);
+
+  const subId = randomUUID();
+  await db.insert(hostingSubscriptionsTable).values({
+    id: subId,
+    userId: req.userId!,
+    botId: id,
+    plan: plan as any,
+    status: "pending",
+    ramGb: hostingPlan.ramGb,
+    storageGb: hostingPlan.storageGb,
+    maxBots: hostingPlan.maxBots,
+    priceRub: hostingPlan.priceRub,
+    yumonyLabel: label,
+  });
+
+  res.json({
+    requiresPayment: true,
+    paymentUrl: url.toString(),
+    subscriptionId: subId,
+    plan: hostingPlan,
+  });
+});
+
+// ─── Generation pipeline ──────────────────────────────────────────────────────
 
 type StepKey = "analyze" | "plan" | "token" | "generate" | "check" | "launch";
 
@@ -191,29 +426,21 @@ async function runGeneration(
   ];
 
   try {
-    // Step 1 — Analyze
     await updateStep(generationId, STEPS, "analyze", "in_progress", elapsed());
     const detectedType = await classifyBotType(description);
     const finalType = detectedType !== botType ? detectedType : botType;
     await updateStep(generationId, STEPS, "analyze", "done", elapsed());
 
-    // Step 2 — Plan (classify & confirm)
     await updateStep(generationId, STEPS, "plan", "in_progress", elapsed());
     await new Promise((r) => setTimeout(r, 500));
     await updateStep(generationId, STEPS, "plan", "done", elapsed());
 
-    // Step 3 — Token check
     await updateStep(generationId, STEPS, "token", "in_progress", elapsed());
-    if (hasToken) {
-      await new Promise((r) => setTimeout(r, 800));
-    }
+    if (hasToken) await new Promise((r) => setTimeout(r, 800));
     await updateStep(generationId, STEPS, "token", "done", elapsed());
 
-    // Step 4 — Generate code
     await updateStep(generationId, STEPS, "generate", "in_progress", elapsed());
     let generatedCode = await generateBotCode(botName, description, finalType);
-
-    // Strip markdown code blocks if AI wrapped the code
     generatedCode = generatedCode
       .replace(/^```python\s*/i, "")
       .replace(/^```\s*/i, "")
@@ -226,43 +453,28 @@ async function runGeneration(
       .where(eq(generationsTable.id, generationId));
     await updateStep(generationId, STEPS, "generate", "done", elapsed());
 
-    // Step 5 — Check & fix errors (up to 3 iterations)
     await updateStep(generationId, STEPS, "check", "in_progress", elapsed());
-
-    const MAX_FIX_ATTEMPTS = 3;
     let fixAttempts = 0;
     let currentCode = generatedCode;
 
-    for (let attempt = 0; attempt < MAX_FIX_ATTEMPTS; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const checkResult = await checkAndFixBotCode(currentCode, botName);
-
-      if (!checkResult.hasErrors || checkResult.errors.length === 0) {
-        logger.info({ generationId, attempt }, "Code passed checks");
-        break;
-      }
-
+      if (!checkResult.hasErrors || checkResult.errors.length === 0) break;
       fixAttempts++;
-      logger.info({ generationId, attempt, errors: checkResult.errors }, "Fixing errors");
-
       if (checkResult.fixedCode) {
         currentCode = checkResult.fixedCode
           .replace(/^```python\s*/i, "")
           .replace(/^```\s*/i, "")
           .replace(/```\s*$/i, "")
           .trim();
-
         await db
           .update(generationsTable)
           .set({ generatedCode: currentCode, fixAttempts, elapsedSeconds: elapsed() })
           .where(eq(generationsTable.id, generationId));
-      } else {
-        break;
-      }
+      } else break;
     }
 
     await updateStep(generationId, STEPS, "check", "done", elapsed());
-
-    // Step 6 — Done
     await updateStep(generationId, STEPS, "launch", "in_progress", elapsed());
     await new Promise((r) => setTimeout(r, 500));
 
@@ -279,12 +491,13 @@ async function runGeneration(
       })
       .where(eq(generationsTable.id, generationId));
 
+    // Status: stopped — user needs to publish manually
     await db
       .update(botsTable)
-      .set({ status: "running", lastActiveAt: new Date() })
+      .set({ status: "stopped" })
       .where(eq(botsTable.id, botId));
 
-    logger.info({ generationId, botId, elapsed: elapsed(), fixAttempts }, "Generation complete");
+    logger.info({ generationId, botId, elapsed: elapsed() }, "Generation complete");
   } catch (err) {
     logger.error({ err, generationId }, "Generation failed");
 
@@ -304,12 +517,11 @@ async function runGeneration(
       })
       .where(eq(generationsTable.id, generationId));
 
-    await db
-      .update(botsTable)
-      .set({ status: "error" })
-      .where(eq(botsTable.id, botId));
+    await db.update(botsTable).set({ status: "error" }).where(eq(botsTable.id, botId));
   }
 }
+
+// ─── CRUD ──────────────────────────────────────────────────────────────────────
 
 router.get("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -322,7 +534,6 @@ router.get("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<vo
     res.status(404).json({ error: "Bot not found" });
     return;
   }
-
   res.json(botToResponse(bot));
 });
 
@@ -340,7 +551,6 @@ router.patch("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<
     return;
   }
 
-  // Deduct credits for improvement
   const [user] = await db.select().from(usersTable).where(eq(usersTable.id, req.userId!));
   if (!user) {
     res.status(404).json({ error: "User not found" });
@@ -348,7 +558,9 @@ router.patch("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<
   }
 
   if (improvement && user.credits < IMPROVE_COST) {
-    res.status(402).json({ error: `Insufficient credits. Need ${IMPROVE_COST}, have ${user.credits}` });
+    res
+      .status(402)
+      .json({ error: `Insufficient credits. Need ${IMPROVE_COST}, have ${user.credits}` });
     return;
   }
 
@@ -367,17 +579,22 @@ router.patch("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<
     });
   }
 
+  const wasRunning = existing.status === "running";
+
   const [updated] = await db
     .update(botsTable)
     .set({
-      description: improvement ? `${existing.description}\n\nУлучшение: ${improvement}` : existing.description,
+      description: improvement
+        ? `${existing.description}\n\nУлучшение: ${improvement}`
+        : existing.description,
       status: improvement ? "generating" : existing.status,
     })
     .where(eq(botsTable.id, id))
     .returning();
 
   if (improvement) {
-    // Simulate re-generation for the improvement
+    if (wasRunning) botRunner.stopBot(id);
+
     const genId = randomUUID();
     await db.insert(generationsTable).values({
       id: genId,
@@ -392,12 +609,13 @@ router.patch("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<
       ],
       creditsUsed: 0,
     });
-
     await db.update(botsTable).set({ generationId: genId }).where(eq(botsTable.id, id));
 
-    runImprovement(genId, id, existing.name, existing.description ?? "", improvement, IMPROVE_COST).catch((err) => {
-      logger.error({ err, genId }, "Improvement pipeline crashed");
-    });
+    runImprovement(genId, id, existing.name, existing.description ?? "", improvement, IMPROVE_COST, wasRunning).catch(
+      (err) => {
+        logger.error({ err, genId }, "Improvement pipeline crashed");
+      },
+    );
   }
 
   res.json(botToResponse(updated));
@@ -410,6 +628,7 @@ async function runImprovement(
   originalDescription: string,
   improvement: string,
   cost: number,
+  relaunchAfter: boolean,
 ) {
   const start = Date.now();
   const elapsed = () => Math.round((Date.now() - start) / 1000);
@@ -466,29 +685,57 @@ async function runImprovement(
       } else break;
     }
     await updateImpStep("check", "done");
-
     await updateImpStep("launch", "in_progress");
     await new Promise((r) => setTimeout(r, 300));
 
     const finalSteps = STEPS.map((s) => ({ key: s.key, label: s.label, status: "done" }));
     await db
       .update(generationsTable)
-      .set({ status: "done", steps: finalSteps, creditsUsed: cost, elapsedSeconds: elapsed(), generatedCode: newCode, fixAttempts })
+      .set({
+        status: "done",
+        steps: finalSteps,
+        creditsUsed: cost,
+        elapsedSeconds: elapsed(),
+        generatedCode: newCode,
+        fixAttempts,
+      })
       .where(eq(generationsTable.id, generationId));
 
-    await db
-      .update(botsTable)
-      .set({ status: "running", lastActiveAt: new Date(), generationId })
-      .where(eq(botsTable.id, botId));
+    if (relaunchAfter) {
+      const [bot] = await db.select().from(botsTable).where(eq(botsTable.id, botId));
+      if (bot?.dirPath) {
+        const { pid } = await botRunner.redeployBot(botId, newCode, bot.dirPath);
+        await db
+          .update(botsTable)
+          .set({ status: "running", generationId, pid, lastActiveAt: new Date() })
+          .where(eq(botsTable.id, botId));
+      } else {
+        await db
+          .update(botsTable)
+          .set({ status: "stopped", generationId })
+          .where(eq(botsTable.id, botId));
+      }
+    } else {
+      await db
+        .update(botsTable)
+        .set({ status: "stopped", generationId })
+        .where(eq(botsTable.id, botId));
+    }
   } catch (err) {
     logger.error({ err, generationId }, "Improvement failed");
     await db
       .update(generationsTable)
-      .set({ status: "failed", errorMessage: err instanceof Error ? err.message : String(err), elapsedSeconds: elapsed() })
+      .set({
+        status: "failed",
+        errorMessage: err instanceof Error ? err.message : String(err),
+        elapsedSeconds: elapsed(),
+      })
       .where(eq(generationsTable.id, generationId));
     await db.update(botsTable).set({ status: "error" }).where(eq(botsTable.id, botId));
   }
 }
+
+// ─── Lifecycle ─────────────────────────────────────────────────────────────────
 
 router.delete("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -502,50 +749,12 @@ router.delete("/bots/:id", requireAuth, async (req: AuthedRequest, res): Promise
     return;
   }
 
+  botRunner.cleanupBot(id);
+  const timer = trialTimers.get(id);
+  if (timer) { clearTimeout(timer); trialTimers.delete(id); }
+
   await db.delete(botsTable).where(eq(botsTable.id, id));
   res.sendStatus(204);
-});
-
-router.post("/bots/:id/restart", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
-  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-  const [bot] = await db
-    .select()
-    .from(botsTable)
-    .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
-
-  if (!bot) {
-    res.status(404).json({ error: "Bot not found" });
-    return;
-  }
-
-  const [updated] = await db
-    .update(botsTable)
-    .set({ status: "running", lastActiveAt: new Date() })
-    .where(eq(botsTable.id, id))
-    .returning();
-
-  res.json(botToResponse(updated));
-});
-
-router.post("/bots/:id/stop", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
-  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-  const [bot] = await db
-    .select()
-    .from(botsTable)
-    .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
-
-  if (!bot) {
-    res.status(404).json({ error: "Bot not found" });
-    return;
-  }
-
-  const [updated] = await db
-    .update(botsTable)
-    .set({ status: "stopped" })
-    .where(eq(botsTable.id, id))
-    .returning();
-
-  res.json(botToResponse(updated));
 });
 
 router.post("/bots/:id/start", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
@@ -555,18 +764,76 @@ router.post("/bots/:id/start", requireAuth, async (req: AuthedRequest, res): Pro
     .from(botsTable)
     .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
 
-  if (!bot) {
-    res.status(404).json({ error: "Bot not found" });
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
+  if (!bot.publishedAt) {
+    res.status(400).json({ error: "Сначала опубликуй бота" });
+    return;
+  }
+  if (!bot.dirPath) {
+    res.status(400).json({ error: "Файлы бота не найдены. Опубликуй заново." });
     return;
   }
 
+  try {
+    const pid = botRunner.startBot(id, bot.dirPath);
+    const [updated] = await db
+      .update(botsTable)
+      .set({ status: "running", pid, lastActiveAt: new Date() })
+      .where(eq(botsTable.id, id))
+      .returning();
+    res.json(botToResponse(updated));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+router.post("/bots/:id/stop", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const [bot] = await db
+    .select()
+    .from(botsTable)
+    .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
+
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
+
+  botRunner.stopBot(id);
+  const timer = trialTimers.get(id);
+  if (timer) { clearTimeout(timer); trialTimers.delete(id); }
+
   const [updated] = await db
     .update(botsTable)
-    .set({ status: "running", lastActiveAt: new Date() })
+    .set({ status: "stopped" })
     .where(eq(botsTable.id, id))
     .returning();
-
   res.json(botToResponse(updated));
+});
+
+router.post("/bots/:id/restart", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const [bot] = await db
+    .select()
+    .from(botsTable)
+    .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
+
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
+  if (!bot.dirPath) {
+    res.status(400).json({ error: "Файлы бота не найдены. Опубликуй заново." });
+    return;
+  }
+
+  try {
+    const pid = botRunner.restartBot(id, bot.dirPath);
+    const [updated] = await db
+      .update(botsTable)
+      .set({ status: "running", pid, lastActiveAt: new Date() })
+      .where(eq(botsTable.id, id))
+      .returning();
+    res.json(botToResponse(updated));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
 });
 
 router.get("/bots/:id/logs", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
@@ -576,25 +843,14 @@ router.get("/bots/:id/logs", requireAuth, async (req: AuthedRequest, res): Promi
     .from(botsTable)
     .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
 
-  if (!bot) {
-    res.status(404).json({ error: "Bot not found" });
-    return;
-  }
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
 
-  const mockLogs = [
-    `[${new Date().toISOString()}] INFO  Bot ${bot.name} started`,
-    `[${new Date().toISOString()}] INFO  Polling started`,
-    `[${new Date().toISOString()}] INFO  Listening for updates...`,
-    `[${new Date().toISOString()}] DEBUG Received /start from user 12345`,
-    `[${new Date().toISOString()}] INFO  Sent welcome message`,
-    `[${new Date().toISOString()}] DEBUG Processed 3 updates in 0.12s`,
-    `[${new Date().toISOString()}] INFO  Memory usage: 42MB / 128MB`,
-  ];
-
-  res.json({ botId: id, lines: mockLogs });
+  const lines = botRunner.getLogs(id);
+  res.json({ botId: id, lines });
 });
 
-// Download code endpoint
+// ─── Download / generations / history ─────────────────────────────────────────
+
 router.get("/bots/:id/download", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const [bot] = await db
@@ -602,12 +858,8 @@ router.get("/bots/:id/download", requireAuth, async (req: AuthedRequest, res): P
     .from(botsTable)
     .where(and(eq(botsTable.id, id), eq(botsTable.userId, req.userId!)));
 
-  if (!bot) {
-    res.status(404).json({ error: "Bot not found" });
-    return;
-  }
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
 
-  // Return download info — actual file served after payment confirmation
   res.json({
     botId: id,
     botName: bot.name,
@@ -625,10 +877,7 @@ router.get("/generations/:id", requireAuth, async (req: AuthedRequest, res): Pro
     .from(generationsTable)
     .where(and(eq(generationsTable.id, id), eq(generationsTable.userId, req.userId!)));
 
-  if (!gen) {
-    res.status(404).json({ error: "Generation not found" });
-    return;
-  }
+  if (!gen) { res.status(404).json({ error: "Generation not found" }); return; }
 
   res.json({
     id: gen.id,
@@ -642,7 +891,6 @@ router.get("/generations/:id", requireAuth, async (req: AuthedRequest, res): Pro
   });
 });
 
-// History — all user's generations
 router.get("/history", requireAuth, async (req: AuthedRequest, res): Promise<void> => {
   const generations = await db
     .select()
@@ -651,11 +899,12 @@ router.get("/history", requireAuth, async (req: AuthedRequest, res): Promise<voi
     .orderBy(desc(generationsTable.createdAt))
     .limit(50);
 
-  // Join bot names
   const botIds = [...new Set(generations.map((g) => g.botId))];
   const bots =
     botIds.length > 0
-      ? await db.select({ id: botsTable.id, name: botsTable.name, botType: botsTable.botType }).from(botsTable)
+      ? await db
+          .select({ id: botsTable.id, name: botsTable.name, botType: botsTable.botType })
+          .from(botsTable)
       : [];
 
   const botMap = new Map(bots.map((b) => [b.id, b]));

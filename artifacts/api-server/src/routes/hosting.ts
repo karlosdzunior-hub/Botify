@@ -5,6 +5,7 @@ import { eq, and } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { requireAuth, type AuthedRequest } from "../middlewares/requireAuth";
 import { notifyUser } from "./telegram-bot-notify";
+import { publishBotAfterPayment } from "./bots";
 
 const router: IRouter = Router();
 
@@ -179,6 +180,13 @@ export async function activateHostingSubscription(label: string): Promise<void> 
     type: "hosting",
     description: `Хостинг ${sub.plan.toUpperCase()} — ${sub.ramGb}GB RAM, ${sub.storageGb}GB SSD (до ${paidUntil.toLocaleDateString("ru")})`,
   });
+
+  // If a specific bot was linked to this subscription, start it now
+  if (sub.botId) {
+    publishBotAfterPayment(sub.botId).catch((err) => {
+      console.error("Failed to publish bot after payment:", err);
+    });
+  }
 
   const [user] = await db.select().from(usersTable).where(eq(usersTable.id, sub.userId));
   if (user?.telegramId) {

@@ -16,6 +16,9 @@ export const botsTable = sqliteTable("bots", {
   pid: integer("pid"),
   dirPath: text("dir_path"),
   lastActiveAt: integer("last_active_at", { mode: "timestamp" }),
+  publishedAt: integer("published_at", { mode: "timestamp" }),
+  trialEndsAt: integer("trial_ends_at", { mode: "timestamp" }),
+  hostingSubId: text("hosting_sub_id"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`).$onUpdate(() => new Date()),
 });
